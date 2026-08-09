@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>SUP → SRT Converter</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<main class="container">
+  <header>
+    <div class="badge">GITHUB ACTIONS TOOL</div>
+    <h1>SUP <span>→</span> SRT</h1>
+    <p>Bulk Blu-ray PGS/SUP OCR converter + SRT cleaner</p>
+  </header>
+
+  <section class="card">
+    <h2>1. GitHub access</h2>
+    <p class="muted">Use a fine-grained token restricted to this repository. It stays in memory and is never stored by this page.</p>
+    <label>Repository</label>
+    <input id="repo" placeholder="owner/repository" autocomplete="off">
+    <label>Fine-grained token</label>
+    <input id="token" type="password" placeholder="github_pat_..." autocomplete="off">
+    <button id="test" class="secondary">Test connection</button>
+    <div id="connection" class="status"></div>
+  </section>
+
+  <section class="card">
+    <h2>2. Files</h2>
+    <input id="files" type="file" accept=".sup" multiple hidden>
+    <label for="files" class="dropzone" id="dropzone">
+      <strong>📁 Select SUP files</strong>
+      <span>Tap here or drop 1–100 .sup files</span>
+    </label>
+    <div id="fileList" class="file-list"></div>
+  </section>
+
+  <section class="card">
+    <h2>3. Processing</h2>
+    <label class="check"><input id="clean" type="checkbox" checked> Clean generated SRT</label>
+    <label class="check"><input id="sounds" type="checkbox" checked> Remove [sound/effect descriptions]</label>
+    <label class="check"><input id="names" type="checkbox" checked> Remove character names at start (e.g. FINN:)</label>
+    <label class="check"><input id="duplicates" type="checkbox" checked> Remove exact duplicate consecutive subtitles</label>
+    <label class="check"><input id="fixocr" type="checkbox" checked> Apply conservative OCR fixes</label>
+  </section>
+
+  <section class="card">
+    <h2>4. Run</h2>
+    <button id="start" class="primary">🚀 Start conversion</button>
+    <div id="progressWrap" class="hidden">
+      <div class="progress"><div id="bar"></div></div>
+      <div id="progressText">Preparing…</div>
+    </div>
+    <pre id="log" class="log"></pre>
+    <a id="download" class="download hidden">⬇️ Download ZIP</a>
+    <a id="runLink" class="run-link hidden" target="_blank" rel="noopener">Open GitHub Actions run</a>
+  </section>
+
+  <footer>
+    Personal utility. Temporary uploaded files are stored in a temporary Git branch and deleted after processing.
+  </footer>
+</main>
+<script src="./app.js"></script>
+</body>
+</html>
