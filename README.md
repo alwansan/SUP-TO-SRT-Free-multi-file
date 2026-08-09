@@ -5,46 +5,30 @@ Personal bulk Blu-ray PGS/SUP → SRT OCR converter powered by GitHub Pages + Gi
 ## Architecture
 
 - `docs/` — static GitHub Pages UI.
-- `.github/workflows/convert.yml` — Ubuntu worker.
+- `.github/workflows/convert.yml` — Ubuntu OCR worker.
 - `.github/workflows/pages.yml` — deploys `docs/` to GitHub Pages.
 - `tools/clean_srt.py` — SRT cleanup.
 - The browser creates a temporary `jobs/<id>` branch through the GitHub Git Data API and uploads all selected `.sup` files there.
-- GitHub Actions processes the files sequentially, cleans the SRTs, and uploads the resulting SRT directory as one workflow artifact. GitHub's artifact download is itself a ZIP containing all generated SRT files.
-- The temporary branch is deleted after the job, even if the conversion fails.
-
-## Security
-
-This is intended as a personal tool. The Pages site asks for a fine-grained GitHub Personal Access Token in the browser.
-
-Create the token with access to this repository only and:
-- Contents: Read and write
-- Actions: Read and write
-
-The token is kept only in memory by the page. It is not put into the repository, URL, localStorage, or cookies.
-
-Do NOT hard-code your token in JavaScript.
+- GitHub Actions processes files sequentially, cleans the generated SRT files, creates one ZIP, and uploads it as an artifact.
+- The temporary branch is deleted after processing, including after failures.
 
 ## OCR
 
-The worker uses Subtitle Edit's headless `seconv` CLI and Tesseract. Subtitle Edit documents direct Blu-ray `.sup` → SubRip conversion with:
+The worker builds Subtitle Edit's current headless `seconv` from source and publishes it for Linux x64. It then uses:
 
-    seconv movie.sup subrip --ocr-engine:tesseract --ocr-language:eng
+`seconv movie.sup subrip --ocr-engine:tesseract --ocr-language:eng`
 
-The workflow pins Subtitle Edit v5.0.0 for reproducibility.
+Subtitle Edit documents Blu-ray `.sup` → SubRip conversion and Tesseract OCR in its command-line documentation.
 
 ## GitHub Pages
 
 Enable Pages from `Settings → Pages` and choose `GitHub Actions` as the source.
 
-## Use
+## Token
 
-1. Push this project to your GitHub repository.
-2. Enable GitHub Pages with GitHub Actions.
-3. Create a fine-grained PAT limited to this repository.
-4. Give it Contents read/write and Actions read/write.
-5. Open the Pages URL.
-6. Enter `owner/repository` and paste the token.
-7. Select all `.sup` files.
-8. Choose cleaning options.
-9. Start the job.
-10. When it finishes, the page downloads the generated ZIP directly when possible. A fallback link to the Actions run is also shown.
+Use a fine-grained GitHub token restricted to this repository with:
+
+- Contents: Read and write
+- Actions: Read and write
+
+The token stays in browser memory and is not stored in the repository, URL, localStorage, or cookies.
