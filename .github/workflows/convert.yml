@@ -7,22 +7,27 @@ on:
         description: Temporary job ID
         required: true
         type: string
+
       clean:
         description: Clean SRT
         required: true
         type: string
+
       remove_sounds:
         description: Remove bracketed sound/effect descriptions
         required: true
         type: string
+
       remove_names:
         description: Remove character names at the beginning
         required: true
         type: string
+
       remove_duplicates:
         description: Remove exact consecutive duplicate subtitles
         required: true
         type: string
+
       fix_ocr:
         description: Conservative OCR fixes
         required: true
@@ -43,100 +48,269 @@ jobs:
     timeout-minutes: 360
 
     steps:
+
+      # --------------------------------------------------
+      # 1. Checkout temporary branch
+      # --------------------------------------------------
+
       - name: Checkout temporary job branch
         uses: actions/checkout@v4
         with:
           ref: jobs/${{ inputs.job_id }}
 
-      - name: Install OCR dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng unzip wget
+      # --------------------------------------------------
+      # 2. Install OCR + .NET
+      # --------------------------------------------------
 
-      - name: Download Subtitle Edit CLI
+      - name: Install dependencies
         run: |
           set -e
-          wget -q --show-progress \
-            https://github.com/SubtitleEdit/subtitleedit/releases/download/v5.0.0/SubtitleEdit-Linux-x64.tar.gz \
-            -O /tmp/se.tar.gz
-          mkdir -p /opt/subtitleedit
-          tar -xzf /tmp/se.tar.gz -C /opt/subtitleedit
-          SECONV="$(find /opt/subtitleedit -type f -name seconv | head -n 1)"
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            tesseract-ocr \
+            tesseract-ocr-eng \
+            wget \
+            unzip \
+            zip \
+            git
+
+          echo "Tesseract:"
+          tesseract --version
+
+          echo "Installing .NET..."
+
+          if ! command -v dotnet >/dev/null 2>&1; then
+            sudo apt-get install -y dotnet-sdk-8.0
+          fi
+
+          dotnet --version
+
+      # --------------------------------------------------
+      # 3. Build official Subtitle Edit seconv
+      # --------------------------------------------------
+
+      - name: Build Subtitle Edit seconv
+        run: |
+          set -e
+
+          rm -rf /tmp/subtitleedit
+
+          git clone --depth 1 \
+            https://github.com/SubtitleEdit/subtitleedit.git \
+            /tmp/subtitleedit
+
+          cd /tmp/subtitleedit
+
+          echo "Building official seconv..."
+
+          dotnet build \
+            src/seconv/SeConv.csproj \
+            -c Release \
+            --no-restore
+
+          SECONV="$(find /tmp/subtitleedit -type f -name 'seconv' | head -n 1)"
+
           if [ -z "$SECONV" ]; then
-            echo "seconv not found in release archive"
-            find /opt/subtitleedit -maxdepth 3 -type f | head -100
+            echo "seconv executable was not found after build."
+            find /tmp/subtitleedit -type f | grep -i seconv | head -100 || true
             exit 1
           fi
+
           chmod +x "$SECONV"
+
           echo "SECONV=$SECONV" >> "$GITHUB_ENV"
+
+          echo "seconv located at:"
+          echo "$SECONV"
+
           "$SECONV" --version
+
+      # --------------------------------------------------
+      # 4. Prepare output
+      # --------------------------------------------------
 
       - name: Prepare directories
         run: |
+          set -e
+
           rm -rf output
           mkdir -p output
+
+      # --------------------------------------------------
+      # 5. Convert SUP → SRT sequentially
+      # --------------------------------------------------
 
       - name: Convert SUP → SRT sequentially
         shell: bash
         run: |
           set -u
+
           JOB="jobs/${{ inputs.job_id }}"
+
           total=$(find "$JOB" -type f -iname '*.sup' | wc -l)
+
           done=0
+          success=0
           failed=0
 
+          echo "=========================================="
+          echo "SUP → SRT"
+          echo "Total SUP files: $total"
+          echo "Processing sequentially"
+          echo "=========================================="
+
+          if [ "$total" -eq 0 ]; then
+            echo "ERROR: No SUP files found."
+            exit 1
+          fi
+
           while IFS= read -r -d '' sup; do
-            done=$((done+1))
+
+            done=$((done + 1))
+
             base="$(basename "$sup")"
-            echo "::group::[$done/$total] $base"
-            echo "Converting with Tesseract OCR…"
+
+            echo ""
+            echo "=========================================="
+            echo "[$done/$total] $base"
+            echo "=========================================="
+
+            echo "Starting Tesseract OCR..."
 
             if "$SECONV" "$sup" subrip \
-                --ocr-engine:tesseract \
-                --ocr-language:eng \
-                --output-folder:output \
-                --overwrite; then
-              echo "OK: $base"
-            else
-              echo "FAILED: $base"
-              failed=$((failed+1))
-            fi
-            echo "::endgroup::"
-          done < <(find "$JOB" -type f -iname '*.sup' -print0 | sort -z)
+              --ocr-engine:tesseract \
+              --ocr-language:eng \
+              --output-folder:output \
+              --overwrite
+            then
 
-          echo "Converted: $((done-failed)) / $total"
-          echo "Failed: $failed"
-          if [ "$done" -eq 0 ]; then exit 1; fi
+              echo "SUCCESS: $base"
+              success=$((success + 1))
+
+            else
+
+              echo "FAILED: $base"
+              failed=$((failed + 1))
+
+            fi
+
+          done < <(
+            find "$JOB" \
+              -type f \
+              -iname '*.sup' \
+              -print0 |
+            sort -z
+          )
+
+          echo ""
+          echo "=========================================="
+          echo "CONVERSION SUMMARY"
+          echo "=========================================="
+          echo "Total:      $total"
+          echo "Successful: $success"
+          echo "Failed:     $failed"
+          echo "=========================================="
+
+          if [ "$success" -eq 0 ]; then
+            echo "ERROR: No files were converted."
+            exit 1
+          fi
+
+      # --------------------------------------------------
+      # 6. Clean generated SRT files
+      # --------------------------------------------------
 
       - name: Clean SRT files
         if: ${{ inputs.clean == 'true' }}
         run: |
+
+          echo "=========================================="
+          echo "Cleaning SRT files"
+          echo "=========================================="
+
+          shopt -s nullglob
+
           for f in output/*.srt; do
-            [ -e "$f" ] || continue
+
+            echo "Cleaning: $(basename "$f")"
+
             python3 tools/clean_srt.py "$f" \
               --remove-sounds "${{ inputs.remove_sounds }}" \
               --remove-names "${{ inputs.remove_names }}" \
               --remove-duplicates "${{ inputs.remove_duplicates }}" \
               --fix-ocr "${{ inputs.fix_ocr }}"
+
           done
+
+      # --------------------------------------------------
+      # 7. Show generated files
+      # --------------------------------------------------
 
       - name: Show output
         run: |
-          find output -type f -name '*.srt' -printf '%f %s bytes\n' | sort
 
-      - name: Upload result ZIP artifact
+          echo "=========================================="
+          echo "GENERATED SRT FILES"
+          echo "=========================================="
+
+          find output \
+            -type f \
+            -name '*.srt' \
+            -printf '%f %s bytes\n' |
+          sort
+
+      # --------------------------------------------------
+      # 8. Create one ZIP containing all SRT files
+      # --------------------------------------------------
+
+      - name: Create ZIP
+        run: |
+
+          set -e
+
+          cd output
+
+          if ! ls *.srt >/dev/null 2>&1; then
+            echo "ERROR: No SRT files found."
+            exit 1
+          fi
+
+          zip -0 -q ../SUP_TO_SRT_results.zip *.srt
+
+          cd ..
+
+          echo "ZIP created:"
+          ls -lh SUP_TO_SRT_results.zip
+
+      # --------------------------------------------------
+      # 9. Upload ZIP
+      # --------------------------------------------------
+
+      - name: Upload result ZIP
         uses: actions/upload-artifact@v4
+
         with:
-          name: subtitle-result
-          path: output/*.srt
+          name: SUP_TO_SRT_results
+          path: SUP_TO_SRT_results.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
 
+      # --------------------------------------------------
+      # 10. Cleanup temporary branch
+      # --------------------------------------------------
+
       - name: Cleanup temporary job branch
         if: ${{ always() }}
+
         env:
           GH_TOKEN: ${{ github.token }}
+
         run: |
-          gh api --method DELETE \
-            "repos/${{ github.repository }}/git/refs/heads/jobs/${{ inputs.job_id }}" || true
+
+          gh api \
+            --method DELETE \
+            "repos/${{ github.repository }}/git/refs/heads/jobs/${{ inputs.job_id }}" \
+            || true
