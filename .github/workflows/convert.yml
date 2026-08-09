@@ -7,27 +7,22 @@ on:
         description: Temporary job ID
         required: true
         type: string
-
       clean:
         description: Clean SRT
         required: true
         type: string
-
       remove_sounds:
         description: Remove bracketed sound/effect descriptions
         required: true
         type: string
-
       remove_names:
         description: Remove character names at the beginning
         required: true
         type: string
-
       remove_duplicates:
-        description: Remove exact consecutive duplicate subtitles
+        description: Remove exact duplicate consecutive subtitles
         required: true
         type: string
-
       fix_ocr:
         description: Conservative OCR fixes
         required: true
@@ -48,109 +43,61 @@ jobs:
     timeout-minutes: 360
 
     steps:
-
-      # --------------------------------------------------
-      # 1. Checkout temporary branch
-      # --------------------------------------------------
-
       - name: Checkout temporary job branch
         uses: actions/checkout@v4
         with:
           ref: jobs/${{ inputs.job_id }}
 
-      # --------------------------------------------------
-      # 2. Install OCR + .NET
-      # --------------------------------------------------
-
-      - name: Install dependencies
+      - name: Install Tesseract
         run: |
           set -e
-
           sudo apt-get update
-
-          sudo apt-get install -y \
-            tesseract-ocr \
-            tesseract-ocr-eng \
-            wget \
-            unzip \
-            zip \
-            git
-
-          echo "Tesseract:"
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng git zip
           tesseract --version
 
-          echo "Installing .NET..."
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
 
-          if ! command -v dotnet >/dev/null 2>&1; then
-            sudo apt-get install -y dotnet-sdk-8.0
-          fi
-
-          dotnet --version
-
-      # --------------------------------------------------
-      # 3. Build official Subtitle Edit seconv
-      # --------------------------------------------------
-
-      - name: Build Subtitle Edit seconv
+      - name: Build and publish official Subtitle Edit seconv
+        shell: bash
         run: |
-          set -e
-
-          rm -rf /tmp/subtitleedit
-
-          git clone --depth 1 \
-            https://github.com/SubtitleEdit/subtitleedit.git \
-            /tmp/subtitleedit
-
+          set -euo pipefail
+          rm -rf /tmp/subtitleedit /opt/subtitleedit
+          git clone --depth 1 https://github.com/SubtitleEdit/subtitleedit.git /tmp/subtitleedit
           cd /tmp/subtitleedit
 
-          echo "Building official seconv..."
+          echo "Subtitle Edit commit:"
+          git rev-parse HEAD
+          echo "seconv target framework:"
+          grep -n 'TargetFramework' src/seconv/SeConv.csproj
 
-          dotnet build \
-            src/seconv/SeConv.csproj \
-            -c Release \
-            --no-restore
+          dotnet restore src/seconv/SeConv.csproj
+          dotnet publish src/seconv/SeConv.csproj             -c Release             -r linux-x64             --self-contained false             -o /opt/subtitleedit
 
-          SECONV="$(find /tmp/subtitleedit -type f -name 'seconv' | head -n 1)"
+          test -x /opt/subtitleedit/seconv
+          chmod +x /opt/subtitleedit/seconv
+          /opt/subtitleedit/seconv --version
+          /opt/subtitleedit/seconv list-ocr-engines || true
 
-          if [ -z "$SECONV" ]; then
-            echo "seconv executable was not found after build."
-            find /tmp/subtitleedit -type f | grep -i seconv | head -100 || true
-            exit 1
-          fi
-
-          chmod +x "$SECONV"
-
-          echo "SECONV=$SECONV" >> "$GITHUB_ENV"
-
-          echo "seconv located at:"
-          echo "$SECONV"
-
-          "$SECONV" --version
-
-      # --------------------------------------------------
-      # 4. Prepare output
-      # --------------------------------------------------
+          echo "SECONV=/opt/subtitleedit/seconv" >> "$GITHUB_ENV"
 
       - name: Prepare directories
         run: |
           set -e
-
           rm -rf output
           mkdir -p output
-
-      # --------------------------------------------------
-      # 5. Convert SUP → SRT sequentially
-      # --------------------------------------------------
+          find "jobs/${{ inputs.job_id }}" -type f -iname '*.sup' -printf '%p %s bytes
+' | sort
 
       - name: Convert SUP → SRT sequentially
         shell: bash
         run: |
-          set -u
+          set -uo pipefail
 
           JOB="jobs/${{ inputs.job_id }}"
-
           total=$(find "$JOB" -type f -iname '*.sup' | wc -l)
-
           done=0
           success=0
           failed=0
@@ -167,9 +114,7 @@ jobs:
           fi
 
           while IFS= read -r -d '' sup; do
-
             done=$((done + 1))
-
             base="$(basename "$sup")"
 
             echo ""
@@ -177,37 +122,18 @@ jobs:
             echo "[$done/$total] $base"
             echo "=========================================="
 
-            echo "Starting Tesseract OCR..."
-
-            if "$SECONV" "$sup" subrip \
-              --ocr-engine:tesseract \
-              --ocr-language:eng \
-              --output-folder:output \
-              --overwrite
+            if "$SECONV" "$sup" subrip               --ocr-engine:tesseract               --ocr-language:eng               --output-folder:output               --overwrite
             then
-
               echo "SUCCESS: $base"
               success=$((success + 1))
-
             else
-
               echo "FAILED: $base"
               failed=$((failed + 1))
-
             fi
+          done < <(find "$JOB" -type f -iname '*.sup' -print0 | sort -z)
 
-          done < <(
-            find "$JOB" \
-              -type f \
-              -iname '*.sup' \
-              -print0 |
-            sort -z
-          )
-
-          echo ""
           echo "=========================================="
           echo "CONVERSION SUMMARY"
-          echo "=========================================="
           echo "Total:      $total"
           echo "Successful: $success"
           echo "Failed:     $failed"
@@ -218,79 +144,45 @@ jobs:
             exit 1
           fi
 
-      # --------------------------------------------------
-      # 6. Clean generated SRT files
-      # --------------------------------------------------
-
       - name: Clean SRT files
         if: ${{ inputs.clean == 'true' }}
+        shell: bash
         run: |
-
-          echo "=========================================="
-          echo "Cleaning SRT files"
-          echo "=========================================="
-
+          set -euo pipefail
           shopt -s nullglob
-
-          for f in output/*.srt; do
-
-            echo "Cleaning: $(basename "$f")"
-
-            python3 tools/clean_srt.py "$f" \
-              --remove-sounds "${{ inputs.remove_sounds }}" \
-              --remove-names "${{ inputs.remove_names }}" \
-              --remove-duplicates "${{ inputs.remove_duplicates }}" \
-              --fix-ocr "${{ inputs.fix_ocr }}"
-
-          done
-
-      # --------------------------------------------------
-      # 7. Show generated files
-      # --------------------------------------------------
-
-      - name: Show output
-        run: |
-
-          echo "=========================================="
-          echo "GENERATED SRT FILES"
-          echo "=========================================="
-
-          find output \
-            -type f \
-            -name '*.srt' \
-            -printf '%f %s bytes\n' |
-          sort
-
-      # --------------------------------------------------
-      # 8. Create one ZIP containing all SRT files
-      # --------------------------------------------------
-
-      - name: Create ZIP
-        run: |
-
-          set -e
-
-          cd output
-
-          if ! ls *.srt >/dev/null 2>&1; then
-            echo "ERROR: No SRT files found."
+          files=(output/*.srt)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "ERROR: No SRT files were generated."
             exit 1
           fi
 
-          zip -0 -q ../SUP_TO_SRT_results.zip *.srt
+          for f in "${files[@]}"; do
+            echo "Cleaning: $(basename "$f")"
+            python3 tools/clean_srt.py "$f"               --remove-sounds "${{ inputs.remove_sounds }}"               --remove-names "${{ inputs.remove_names }}"               --remove-duplicates "${{ inputs.remove_duplicates }}"               --fix-ocr "${{ inputs.fix_ocr }}"
+          done
 
+      - name: Show output
+        run: |
+          find output -type f -name '*.srt' -printf '%f %s bytes
+' | sort
+
+      - name: Create ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd output
+          shopt -s nullglob
+          files=(*.srt)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "ERROR: No SRT files found."
+            exit 1
+          fi
+          zip -0 -q ../SUP_TO_SRT_results.zip "${files[@]}"
           cd ..
-
-          echo "ZIP created:"
           ls -lh SUP_TO_SRT_results.zip
-
-      # --------------------------------------------------
-      # 9. Upload ZIP
-      # --------------------------------------------------
 
       - name: Upload result ZIP
         uses: actions/upload-artifact@v4
-
         with:
           name: SUP_TO_SRT_results
           path: SUP_TO_SRT_results.zip
@@ -298,19 +190,9 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-      # --------------------------------------------------
-      # 10. Cleanup temporary branch
-      # --------------------------------------------------
-
       - name: Cleanup temporary job branch
         if: ${{ always() }}
-
         env:
           GH_TOKEN: ${{ github.token }}
-
         run: |
-
-          gh api \
-            --method DELETE \
-            "repos/${{ github.repository }}/git/refs/heads/jobs/${{ inputs.job_id }}" \
-            || true
+          gh api             --method DELETE             "repos/${{ github.repository }}/git/refs/heads/jobs/${{ inputs.job_id }}"             || true
