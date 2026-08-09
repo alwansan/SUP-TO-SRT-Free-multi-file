@@ -1,109 +1,417 @@
 #!/usr/bin/env python3
-"""
-SRT cleaner.
 
-- Removes standalone or inline bracketed sound/effect descriptions.
-- Removes character names only at the start of a subtitle line, e.g.:
-      FINN: Hello!
-  ->  Hello!
-- Removes exact consecutive duplicate subtitle blocks.
-- Applies a few conservative OCR text fixes.
-"""
-
-from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
 
-BRACKET_RE = re.compile(r"[\[(（【][^\]\)）】]{1,140}[\]\)）】]")
 
-# Deliberately conservative. It only strips names when they occur at line start
-# and are uppercase-ish, avoiding normal English text containing colons.
-NAME_RE = re.compile(
-    r"^\s*([A-Z][A-Z0-9'’.\-]*(?:\s+[A-Z][A-Z0-9'’.\-]*){0,3})\s*:\s+"
+SOUND_PATTERN = re.compile(
+    r"""
+    ^\s*
+    [
+        \(
+        \[
+    ]
+    \s*
+    (?:
+        music|
+        musical|
+        singing|
+        sings|
+        song|
+        laugh(?:s|ing)?|
+        laughter|
+        crying|
+        sobbing|
+        sigh(?:s|ing)?|
+        gasp(?:s|ing)?|
+        groan(?:s|ing)?|
+        scream(?:s|ing)?|
+        yelling|
+        shouting|
+        whisper(?:s|ing)?|
+        breathing|
+        footsteps|
+        footstep|
+        door|
+        doors|
+        knock(?:s|ing)?|
+        knocking|
+        phone|
+        telephone|
+        bell|
+        bells|
+        beep(?:s|ing)?|
+        beeps|
+        buzz(?:s|ing)?|
+        buzzing|
+        crowd|
+        applause|
+        clapping|
+        cheering|
+        wind|
+        rain|
+        thunder|
+        lightning|
+        gunshot(?:s)?|
+        gunfire|
+        explosion(?:s)?|
+        crash(?:es)?|
+        squeak(?:s|ing)?|
+        mouse\s+squeak(?:s)?|
+        dog\s+bark(?:s|ing)?|
+        barking|
+        cat\s+meow(?:s|ing)?|
+        meow(?:s|ing)?|
+        roar(?:s|ing)?|
+        growl(?:s|ing)?|
+        growling|
+        grunts?|
+        [a-z]+
+    )
+    \s*
+    [
+        \]
+        \)
+    ]
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
-def bool_arg(value: str) -> bool:
-    return value.lower() in {"1", "true", "yes", "on"}
 
-def read_srt(path: Path) -> str:
-    raw = path.read_bytes()
-    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            pass
-    return raw.decode("utf-8", errors="replace")
-
-def blocks(text: str):
-    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    return re.split(r"\n{2,}", text) if text else []
-
-def parse_block(block: str):
-    lines = block.split("\n")
-    if len(lines) < 3 or "-->" not in lines[1]:
-        return None
-    return lines[1].strip(), lines[2:]
-
-def is_sound_description(text: str) -> bool:
-    inner = text.strip()[1:-1].strip().lower()
-    keywords = (
-        "mouse squeak", "mouse squeaks", "squeak", "squeaks",
-        "footstep", "footsteps", "laugh", "laughs", "laughing",
-        "cry", "cries", "crying", "scream", "screams", "screaming",
-        "shout", "shouts", "shouting", "whisper", "whispers",
-        "whispering", "gasp", "gasps", "sigh", "sighs", "groan",
-        "groans", "grunt", "grunts", "cough", "coughs", "sneeze",
-        "sneezes", "breathing", "music", "noise", "sound", "sfx",
-        "effect", "effects", "door", "doors",
+# Character names that appear at the beginning of dialogue.
+#
+# Examples:
+# FINN: Hey Jake!
+# JAKE: What?
+# BMO: Hello!
+#
+# Be conservative:
+# - Only remove a name when it is at the beginning.
+# - Require a colon.
+# - Require a reasonably short name.
+# - Do not touch ordinary sentences containing colons later.
+NAME_PATTERN = re.compile(
+    r"""
+    ^\s*
+    (?P<name>
+        [A-Z][A-Z0-9' ._-]{0,24}
     )
-    return any(k in inner for k in keywords)
+    \s*:\s*
+    (?P<text>.+)
+    $
+    """,
+    re.VERBOSE,
+)
 
-def clean_line(line: str, remove_sounds: bool, remove_names: bool, fix_ocr: bool):
-    line = line.strip()
-    if not line:
-        return ""
 
-    if remove_sounds:
-        # Remove complete bracketed chunks. A cue that becomes empty is dropped.
-        chunks = BRACKET_RE.findall(line)
-        if chunks and all(is_sound_description(c) for c in chunks):
-            line = BRACKET_RE.sub("", line)
-        else:
-            for c in chunks:
-                if is_sound_description(c):
-                    line = line.replace(c, "")
+OCR_REPLACEMENTS = [
+    (r"\bI['’]m\b", "I'm"),
+    (r"\bI['’]ll\b", "I'll"),
+    (r"\bI['’]ve\b", "I've"),
+    (r"\bcan['’]t\b", "can't"),
+    (r"\bwon['’]t\b", "won't"),
+    (r"\bdon['’]t\b", "don't"),
+    (r"\bdoesn['’]t\b", "doesn't"),
+    (r"\bdidn['’]t\b", "didn't"),
+    (r"\bisn['’]t\b", "isn't"),
+    (r"\baren['’]t\b", "aren't"),
+    (r"\bwasn['’]t\b", "wasn't"),
+    (r"\bweren['’]t\b", "weren't"),
+    (r"\bwouldn['’]t\b", "wouldn't"),
+    (r"\bshouldn['’]t\b", "shouldn't"),
+    (r"\bcouldn['’]t\b", "couldn't"),
+]
+
+
+def parse_srt(text: str):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    blocks = re.split(r"\n\s*\n", text.strip())
+
+    entries = []
+
+    for block in blocks:
+
+        lines = block.split("\n")
+
+        if len(lines) < 3:
+            continue
+
+        number = lines[0].strip()
+        timing = lines[1].strip()
+        subtitle_text = "\n".join(lines[2:]).strip()
+
+        if not re.match(
+            r"^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}",
+            timing,
+        ):
+            continue
+
+        entries.append(
+            {
+                "number": number,
+                "timing": timing,
+                "text": subtitle_text,
+            }
+        )
+
+    return entries
+
+
+def clean_sounds(text: str):
+    lines = []
+
+    for line in text.splitlines():
+
+        line = line.strip()
+
+        if not line:
+            continue
+
+        # Remove complete [ ... ] / ( ... ) sound-only subtitles.
+        if SOUND_PATTERN.match(line):
+            continue
+
+        # Remove bracketed sound/effect descriptions inside dialogue.
+        line = re.sub(
+            r"\[[^\]]{1,100}\]",
+            "",
+            line,
+        )
+
+        line = re.sub(
+            r"\([^)]{1,100}\)",
+            lambda m: (
+                ""
+                if re.search(
+                    r"(mouse|squeak|music|laugh|sound|noise|door|footstep|"
+                    r"breath|scream|cry|gasp|groan|whisper|buzz|beep|"
+                    r"applause|cheer|thunder|rain|wind|explosion)",
+                    m.group(0),
+                    re.IGNORECASE,
+                )
+                else m.group(0)
+            ),
+            line,
+        )
+
         line = re.sub(r"[ \t]{2,}", " ", line).strip()
 
-    if remove_names:
-        line = NAME_RE.sub("", line, count=1)
+        if line:
+            lines.append(line)
 
-    if fix_ocr:
-        line = line.replace("’", "'")
-        line = re.sub(r"[ \t]+([,.!?;:])", r"\1", line)
-        line = re.sub(r"([!?.,]){4,}", lambda m: m.group(0)[:3], line)
+    return "\n".join(lines)
 
-    return line.strip()
 
-def process(path: Path, remove_sounds=True, remove_names=True,
-            remove_duplicates=True, fix_ocr=True):
+def remove_character_names(text: str):
+    lines = []
+
+    for line in text.splitlines():
+
+        match = NAME_PATTERN.match(line)
+
+        if match:
+
+            name = match.group("name").strip()
+            remaining = match.group("text").strip()
+
+            # Avoid removing things that look like normal uppercase
+            # text with a colon.
+            if len(name) <= 25 and remaining:
+                line = remaining
+
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def fix_ocr(text: str):
+
+    for pattern, replacement in OCR_REPLACEMENTS:
+        text = re.sub(
+            pattern,
+            replacement,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    # Common OCR spacing problems.
+    text = re.sub(r"[ \t]{2,}", " ", text)
+
+    # Space before punctuation.
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+
+    return text.strip()
+
+
+def normalize_text(text: str):
+    return re.sub(
+        r"\s+",
+        " ",
+        text.replace("\n", " ").strip(),
+    ).casefold()
+
+
+def remove_duplicate_entries(entries):
+
+    result = []
+
+    previous = None
+
+    for entry in entries:
+
+        current = (
+            entry["timing"],
+            normalize_text(entry["text"]),
+        )
+
+        if previous is not None and current == previous:
+            continue
+
+        result.append(entry)
+        previous = current
+
+    return result
+
+
+def clean_entries(
+    entries,
+    remove_sounds=True,
+    remove_names=True,
+    remove_duplicates=True,
+    fix_ocr_enabled=True,
+):
+
+    cleaned = []
+
+    for entry in entries:
+
+        text = entry["text"]
+
+        if remove_sounds:
+            text = clean_sounds(text)
+
+        if remove_names:
+            text = remove_character_names(text)
+
+        if fix_ocr_enabled:
+            text = fix_ocr(text)
+
+        text = text.strip()
+
+        # If cleaning removed the entire subtitle,
+        # skip the subtitle block.
+        if not text:
+            continue
+
+        entry = dict(entry)
+        entry["text"] = text
+
+        cleaned.append(entry)
+
+    if remove_duplicates:
+        cleaned = remove_duplicate_entries(cleaned)
+
+    # Renumber SRT entries sequentially.
+    for index, entry in enumerate(cleaned, start=1):
+        entry["number"] = str(index)
+
+    return cleaned
+
+
+def write_srt(entries, path: Path):
+
     output = []
-    previous_text = None
 
-    for block in blocks(read_srt(path)):
-        parsed = parse_block(block)
-        if not parsed:
-            continue
+    for entry in entries:
 
-        timing, text_lines = parsed
-        cleaned_lines = [
-            clean_line(line, remove_sounds, remove_names, fix_ocr)
-            for line in text_lines
-        ]
-        cleaned_lines = [x for x in cleaned_lines if x]
+        output.append(
+            f"{entry['number']}\n"
+            f"{entry['timing']}\n"
+            f"{entry['text']}"
+        )
 
-        if not cleaned_lines:
-            continue
+    content = "\n\n".join(output)
+
+    if content:
+        content += "\n"
+
+    path.write_text(
+        content,
+        encoding="utf-8-sig",
+    )
+
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Clean OCR-generated SRT subtitles."
+    )
+
+    parser.add_argument(
+        "file",
+        help="SRT file to clean",
+    )
+
+    parser.add_argument(
+        "--remove-sounds",
+        default="true",
+    )
+
+    parser.add_argument(
+        "--remove-names",
+        default="true",
+    )
+
+    parser.add_argument(
+        "--remove-duplicates",
+        default="true",
+    )
+
+    parser.add_argument(
+        "--fix-ocr",
+        default="true",
+    )
+
+    args = parser.parse_args()
+
+    path = Path(args.file)
+
+    if not path.exists():
+        raise SystemExit(
+            f"File not found: {path}"
+        )
+
+    text = path.read_text(
+        encoding="utf-8-sig",
+        errors="replace",
+    )
+
+    entries = parse_srt(text)
+
+    cleaned = clean_entries(
+        entries,
+        remove_sounds=args.remove_sounds.lower() == "true",
+        remove_names=args.remove_names.lower() == "true",
+        remove_duplicates=args.remove_duplicates.lower() == "true",
+        fix_ocr_enabled=args.fix_ocr.lower() == "true",
+    )
+
+    write_srt(
+        cleaned,
+        path,
+    )
+
+    print(
+        f"Cleaned: {path.name} "
+        f"({len(entries)} → {len(cleaned)} subtitles)"
+    )
+
+
+if __name__ == "__main__":
+    main()            continue
 
         text = "\n".join(cleaned_lines)
 
