@@ -1,0 +1,142 @@
+name: SUP → SRT
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Temporary job ID
+        required: true
+        type: string
+      clean:
+        description: Clean SRT
+        required: true
+        type: string
+      remove_sounds:
+        description: Remove bracketed sound/effect descriptions
+        required: true
+        type: string
+      remove_names:
+        description: Remove character names at the beginning
+        required: true
+        type: string
+      remove_duplicates:
+        description: Remove exact consecutive duplicate subtitles
+        required: true
+        type: string
+      fix_ocr:
+        description: Conservative OCR fixes
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: subtitle-job-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    name: OCR and clean
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout temporary job branch
+        uses: actions/checkout@v4
+        with:
+          ref: jobs/${{ inputs.job_id }}
+
+      - name: Install OCR dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng unzip wget
+
+      - name: Download Subtitle Edit CLI
+        run: |
+          set -e
+          wget -q --show-progress \
+            https://github.com/SubtitleEdit/subtitleedit/releases/download/v5.0.0/SubtitleEdit-Linux-x64.tar.gz \
+            -O /tmp/se.tar.gz
+          mkdir -p /opt/subtitleedit
+          tar -xzf /tmp/se.tar.gz -C /opt/subtitleedit
+          SECONV="$(find /opt/subtitleedit -type f -name seconv | head -n 1)"
+          if [ -z "$SECONV" ]; then
+            echo "seconv not found in release archive"
+            find /opt/subtitleedit -maxdepth 3 -type f | head -100
+            exit 1
+          fi
+          chmod +x "$SECONV"
+          echo "SECONV=$SECONV" >> "$GITHUB_ENV"
+          "$SECONV" --version
+
+      - name: Prepare directories
+        run: |
+          rm -rf output
+          mkdir -p output
+
+      - name: Convert SUP → SRT sequentially
+        shell: bash
+        run: |
+          set -u
+          JOB="jobs/${{ inputs.job_id }}"
+          total=$(find "$JOB" -type f -iname '*.sup' | wc -l)
+          done=0
+          failed=0
+
+          while IFS= read -r -d '' sup; do
+            done=$((done+1))
+            base="$(basename "$sup")"
+            echo "::group::[$done/$total] $base"
+            echo "Converting with Tesseract OCR…"
+
+            if "$SECONV" "$sup" subrip \
+                --ocr-engine:tesseract \
+                --ocr-language:eng \
+                --output-folder:output \
+                --overwrite; then
+              echo "OK: $base"
+            else
+              echo "FAILED: $base"
+              failed=$((failed+1))
+            fi
+            echo "::endgroup::"
+          done < <(find "$JOB" -type f -iname '*.sup' -print0 | sort -z)
+
+          echo "Converted: $((done-failed)) / $total"
+          echo "Failed: $failed"
+          if [ "$done" -eq 0 ]; then exit 1; fi
+
+      - name: Clean SRT files
+        if: ${{ inputs.clean == 'true' }}
+        run: |
+          for f in output/*.srt; do
+            [ -e "$f" ] || continue
+            python3 tools/clean_srt.py "$f" \
+              --remove-sounds "${{ inputs.remove_sounds }}" \
+              --remove-names "${{ inputs.remove_names }}" \
+              --remove-duplicates "${{ inputs.remove_duplicates }}" \
+              --fix-ocr "${{ inputs.fix_ocr }}"
+          done
+
+      - name: Show output
+        run: |
+          find output -type f -name '*.srt' -printf '%f %s bytes\n' | sort
+
+      - name: Upload result ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: subtitle-result
+          path: output/*.srt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Cleanup temporary job branch
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method DELETE \
+            "repos/${{ github.repository }}/git/refs/heads/jobs/${{ inputs.job_id }}" || true
