@@ -41,6 +41,13 @@ jobs:
     name: OCR and clean
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      # seconv uses a console-rendering library that silently prints an
+      # empty panel (exit code 0, no visible text) when TERM is unset or
+      # unrecognized. GitHub Actions runners don't always provide a TERM
+      # that seconv understands, so we pin one explicitly for reliable,
+      # readable logs from every seconv invocation in this job.
+      TERM: xterm-256color
 
     steps:
       - name: Checkout temporary job branch
@@ -52,19 +59,97 @@ jobs:
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng git zip
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng git zip jq
           tesseract --version
 
-      - name: Install .NET 10 SDK
+      # ------------------------------------------------------------------
+      # seconv acquisition strategy
+      #
+      # Preferred: download the official prebuilt "SeConv-Linux-x64.tar.gz"
+      # asset that Subtitle Edit's own GitHub Actions workflow attaches to
+      # its releases (https://github.com/SubtitleEdit/subtitleedit/releases).
+      # This binary is self-contained (no .NET runtime required on the
+      # runner) and avoids any NuGet/.NET SDK build entirely, which removes
+      # the "project.assets.json not found" failure class completely.
+      #
+      # Fallback: if the prebuilt asset can't be found or fails a basic
+      # sanity check (e.g. Subtitle Edit stops shipping it, or GitHub is
+      # having an outage for release assets), build seconv from the
+      # official source with a correct restore -> publish sequence.
+      # ------------------------------------------------------------------
+      - name: Try official prebuilt seconv
+        id: prebuilt
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p /opt/subtitleedit
+
+          echo "Looking up SeConv-Linux-x64.tar.gz on the latest official release..."
+          ASSET_URL=$(gh api repos/SubtitleEdit/subtitleedit/releases/latest --jq \
+            '.assets[]? | select(.name=="SeConv-Linux-x64.tar.gz") | .browser_download_url' 2>/dev/null || true)
+          ASSET_DIGEST=$(gh api repos/SubtitleEdit/subtitleedit/releases/latest --jq \
+            '.assets[]? | select(.name=="SeConv-Linux-x64.tar.gz") | .digest' 2>/dev/null || true)
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "Not on the latest release, scanning recent releases instead..."
+            ASSET_URL=$(gh api repos/SubtitleEdit/subtitleedit/releases --jq \
+              '.[] | .assets[]? | select(.name=="SeConv-Linux-x64.tar.gz") | .browser_download_url' 2>/dev/null | head -n1 || true)
+            ASSET_DIGEST=$(gh api repos/SubtitleEdit/subtitleedit/releases --jq \
+              '.[] | .assets[]? | select(.name=="SeConv-Linux-x64.tar.gz") | .digest' 2>/dev/null | head -n1 || true)
+          fi
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "No prebuilt seconv asset found. Will build from source."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found: $ASSET_URL"
+          if ! curl -fsSL "$ASSET_URL" -o /tmp/seconv.tar.gz; then
+            echo "Download failed. Will build from source."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "$ASSET_DIGEST" ] && [ "$ASSET_DIGEST" != "null" ]; then
+            expected="${ASSET_DIGEST#sha256:}"
+            actual=$(sha256sum /tmp/seconv.tar.gz | cut -d' ' -f1)
+            if [ "$expected" != "$actual" ]; then
+              echo "Checksum mismatch (expected $expected, got $actual). Will build from source."
+              echo "ok=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Checksum verified."
+          fi
+
+          tar -xzf /tmp/seconv.tar.gz -C /opt/subtitleedit
+          chmod +x /opt/subtitleedit/seconv
+
+          if /opt/subtitleedit/seconv --help > /tmp/seconv_help.txt 2>&1 && grep -qi "usage" /tmp/seconv_help.txt; then
+            echo "Prebuilt seconv passed sanity check."
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Prebuilt seconv failed sanity check. Will build from source."
+            cat /tmp/seconv_help.txt || true
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install .NET SDK (fallback build only)
+        if: steps.prebuilt.outputs.ok != 'true'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
 
-      - name: Build and publish official Subtitle Edit seconv
+      - name: Build official seconv from source (fallback build only)
+        if: steps.prebuilt.outputs.ok != 'true'
         shell: bash
         run: |
           set -euo pipefail
           rm -rf /tmp/subtitleedit /opt/subtitleedit
+          mkdir -p /opt/subtitleedit
           git clone --depth 1 https://github.com/SubtitleEdit/subtitleedit.git /tmp/subtitleedit
           cd /tmp/subtitleedit
 
@@ -74,13 +159,21 @@ jobs:
           grep -n 'TargetFramework' src/seconv/SeConv.csproj
 
           dotnet restore src/seconv/SeConv.csproj
-          dotnet publish src/seconv/SeConv.csproj             -c Release             -r linux-x64             --self-contained false             -o /opt/subtitleedit
+          dotnet publish src/seconv/SeConv.csproj \
+            -c Release \
+            -r linux-x64 \
+            --self-contained false \
+            --no-restore \
+            -o /opt/subtitleedit
 
-          test -x /opt/subtitleedit/seconv
           chmod +x /opt/subtitleedit/seconv
-          /opt/subtitleedit/seconv --version
-          /opt/subtitleedit/seconv list-ocr-engines || true
 
+      - name: Confirm seconv is ready
+        run: |
+          set -euo pipefail
+          test -x /opt/subtitleedit/seconv
+          echo "Using seconv from: $([ '${{ steps.prebuilt.outputs.ok }}' = 'true' ] && echo 'official prebuilt release' || echo 'source build')"
+          /opt/subtitleedit/seconv --help | head -5
           echo "SECONV=/opt/subtitleedit/seconv" >> "$GITHUB_ENV"
 
       - name: Prepare directories
@@ -88,8 +181,7 @@ jobs:
           set -e
           rm -rf output
           mkdir -p output
-          find "jobs/${{ inputs.job_id }}" -type f -iname '*.sup' -printf '%p %s bytes
-' | sort
+          find "jobs/${{ inputs.job_id }}" -type f -iname '*.sup' -printf '%p %s bytes\n' | sort
 
       - name: Convert SUP → SRT sequentially
         shell: bash
@@ -101,6 +193,8 @@ jobs:
           done=0
           success=0
           failed=0
+          success_names=()
+          failed_names=()
 
           echo "=========================================="
           echo "SUP → SRT"
@@ -120,24 +214,58 @@ jobs:
             echo ""
             echo "=========================================="
             echo "[$done/$total] $base"
+            echo "Input: $base"
+            echo "OCR engine: Tesseract"
+            echo "Language: eng"
             echo "=========================================="
 
-            if "$SECONV" "$sup" subrip               --ocr-engine:tesseract               --ocr-language:eng               --output-folder:output               --overwrite
+            if "$SECONV" "$sup" subrip \
+              --ocr-engine:tesseract \
+              --ocr-language:eng \
+              --output-folder:output \
+              --overwrite
             then
-              echo "SUCCESS: $base"
+              echo "SUCCESS: $base -> ${base%.*}.srt"
               success=$((success + 1))
+              success_names+=("$base")
             else
+              code=$?
               echo "FAILED: $base"
+              echo "Exit code: $code"
               failed=$((failed + 1))
+              failed_names+=("$base")
             fi
           done < <(find "$JOB" -type f -iname '*.sup' -print0 | sort -z)
 
           echo "=========================================="
           echo "CONVERSION SUMMARY"
-          echo "Total:      $total"
+          echo "Processed:  $total"
           echo "Successful: $success"
           echo "Failed:     $failed"
           echo "=========================================="
+
+          {
+            echo "SUP -> SRT conversion report"
+            echo "Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "Processed:  $total"
+            echo "Successful: $success"
+            echo "Failed:     $failed"
+            echo ""
+            echo "Successful files:"
+            if [ "${#success_names[@]}" -eq 0 ]; then
+              echo "  (none)"
+            else
+              for n in "${success_names[@]}"; do echo "  - $n"; done
+            fi
+            echo ""
+            echo "Failed files:"
+            if [ "${#failed_names[@]}" -eq 0 ]; then
+              echo "  (none)"
+            else
+              for n in "${failed_names[@]}"; do echo "  - $n"; done
+            fi
+          } > output/conversion-report.txt
 
           if [ "$success" -eq 0 ]; then
             echo "ERROR: No files were converted."
@@ -158,13 +286,16 @@ jobs:
 
           for f in "${files[@]}"; do
             echo "Cleaning: $(basename "$f")"
-            python3 tools/clean_srt.py "$f"               --remove-sounds "${{ inputs.remove_sounds }}"               --remove-names "${{ inputs.remove_names }}"               --remove-duplicates "${{ inputs.remove_duplicates }}"               --fix-ocr "${{ inputs.fix_ocr }}"
+            python3 tools/clean_srt.py "$f" \
+              --remove-sounds "${{ inputs.remove_sounds }}" \
+              --remove-names "${{ inputs.remove_names }}" \
+              --remove-duplicates "${{ inputs.remove_duplicates }}" \
+              --fix-ocr "${{ inputs.fix_ocr }}"
           done
 
       - name: Show output
         run: |
-          find output -type f -name '*.srt' -printf '%f %s bytes
-' | sort
+          find output -type f -printf '%f %s bytes\n' | sort
 
       - name: Create ZIP
         shell: bash
@@ -172,7 +303,7 @@ jobs:
           set -euo pipefail
           cd output
           shopt -s nullglob
-          files=(*.srt)
+          files=(*.srt conversion-report.txt)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "ERROR: No SRT files found."
             exit 1
@@ -195,4 +326,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api             --method DELETE             "repos/${{ github.repository }}/git/refs/heads/jobs/${{ inputs.job_id }}"             || true
+          gh api \
+            --method DELETE \
+            "repos/${{ github.repository }}/git/refs/heads/jobs/${{ inputs.job_id }}" \
+            || true
